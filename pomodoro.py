@@ -16,7 +16,7 @@ Kontrol saat berjalan:
   [s] skip fase saat ini
   [q] keluar dari aplikasi
 """
-
+import random
 import os
 import sys
 import time
@@ -27,14 +27,19 @@ import platform
 import threading
 import subprocess
 
-from rich.console import Console
+from rich.console import Console, Group
+from rich.layout import Layout
 from rich.panel import Panel
-from rich.live import Live
 from rich.align import Align
 from rich.text import Text
-from rich.table import Table
+from rich.columns import Columns
 from rich.progress import Progress, BarColumn, TextColumn
-from rich.layout import Layout
+from rich.table import Table
+from rich.live import Live
+from rich import box
+
+from pyfiglet import Figlet
+
 import hashlib
 from pathlib import Path
 import numpy as np
@@ -42,6 +47,8 @@ import numpy as np
 CACHE_DIR = Path.home() / ".pomodoro" / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 console = Console()
+
+fig = Figlet(font="big")
 
 try:
     import sounddevice as sd
@@ -159,6 +166,10 @@ class AudioVisualizerPlayer:
         self.filepath = None
         self.tempdir = None
         self._level = 0.0
+
+        self._levels = np.zeros(32)
+
+        self._smooth = np.zeros(32)
         self._pause_event = threading.Event()
         self._stop_event = threading.Event()
         self._thread = None
@@ -232,8 +243,11 @@ class AudioVisualizerPlayer:
             self.error = "File audio hasil unduhan tidak ditemukan."
             return False
         console.print("[bold green]✓ Audio berhasil disimpan ke cache[/]")
-        self.filepath = expected
+
+        self.filepath = str(cache_file)
+
         self.ready = True
+
         return True
 
     def play(self):
@@ -257,8 +271,102 @@ class AudioVisualizerPlayer:
                             f.seek(0)  # loop lagu jika sesi lebih panjang dari durasi lagu
                             continue
                         stream.write(data)
-                        rms = float(np.sqrt(np.mean(np.square(data)))) if data.size else 0.0
-                        self._level = min(rms * 8.0, 1.0)
+                        if data.size:
+
+                            rms = np.sqrt(np.mean(data ** 2))
+
+                            self._level = min(rms * 8.0, 1.0)
+
+                            # stereo -> mono
+                            if data.ndim > 1:
+                                mono = data.mean(axis=1)
+                            else:
+                                mono = data
+
+                            # windowing
+                            mono = mono * np.hanning(len(mono))
+
+                            # FFT
+                            fft = np.abs(np.fft.rfft(mono))
+
+                            # Buang DC
+                            fft = fft[1:]
+
+                            # Ambil frekuensi penting
+                            fft = fft[:1024]
+
+                            num_bars = 48
+
+                            edges = np.geomspace(
+                                1,
+                                len(fft),
+                                num_bars + 1
+                            ).astype(int)
+
+                            levels = []
+
+                            for i in range(num_bars):
+
+                                start = edges[i]
+                                end = edges[i + 1]
+
+                                band = fft[start:end]
+
+                                if len(band):
+                                    levels.append(np.max(band))
+                                else:
+                                    levels.append(0)
+
+                            levels = np.array(levels)
+                            # 32 band
+                            # bands = np.array_split(fft, 32)
+
+                            # levels = np.array([
+                            #     band.mean() if len(band) else 0
+                            #     for band in bands
+                            # ])
+                            edges = np.geomspace(
+                                1,
+                                len(fft),
+                                33
+                            ).astype(int)
+
+                            levels = []
+
+                            for i in range(32):
+
+                                start = edges[i]
+
+                                end = edges[i + 1]
+
+                                band = fft[start:end]
+
+                                levels.append(
+                                    band.mean() if len(band) else 0
+                                )
+
+                            levels = np.array(levels)
+
+                            # Log scale
+                            levels = np.log1p(levels * 25)
+
+                            mx = np.percentile(levels, 95)
+
+                            if mx > 0:
+                                levels /= mx
+
+                            levels = np.clip(levels, 0, 1)
+                            levels = np.maximum(levels, self._smooth * 0.85)
+                            # Smooth
+                            self._smooth = (
+                                self._smooth * 0.80
+                                +
+                                levels * 0.20
+                            )
+
+                        else:
+
+                            self._level = 0
         except Exception:
             self._level = 0.0
 
@@ -288,7 +396,10 @@ class AudioVisualizerPlayer:
 
     def get_level(self) -> float:
         return self._level
-
+    
+    def get_levels(self):
+        return self._smooth.tolist()
+    
     def _cache_file(self):
 
         name = hashlib.md5(
@@ -297,14 +408,6 @@ class AudioVisualizerPlayer:
 
         return CACHE_DIR / f"{name}.wav"
 
-
-# ---------------------------------------------------------------------------
-# Helper tampilan
-# ---------------------------------------------------------------------------
-def render_bar(level: float, width: int = 30) -> str:
-    filled = int(level * width)
-    filled = max(0, min(width, filled))
-    return "[" + "█" * filled + "░" * (width - filled) + "]"
 
 
 def clear_screen():
@@ -333,141 +436,356 @@ def prompt_int(label: str, default: int) -> int:
         return default
 
 
+def build_header(title, music, phase):
+
+    table = Table.grid(expand=True)
+
+    table.add_column(justify="left")
+    table.add_column(justify="center")
+    table.add_column(justify="right")
+
+    phase_color = {
+        "FOCUS": "red",
+        "BREAK": "green"
+    }.get(phase.upper(), "cyan")
+
+    table.add_row(
+        "[bold red]🍅 Pomodoro[/]",
+        f"[bold cyan]{title}[/]",
+        f"[bold {phase_color}]🎵 {music}[/]"
+    )
+
+    return Panel(
+        table,
+        border_style="bright_blue",
+        box=box.ROUNDED,
+    )
+
+def build_footer():
+
+    table = Table.grid(expand=True)
+
+    table.add_column()
+
+    table.add_row(
+        "[bold cyan][P][/bold cyan] Pause    "
+        "[bold yellow][S][/bold yellow] Skip    "
+        "[bold red][Q][/bold red] Quit"
+    )
+
+    return Panel(
+        Align.center(table),
+        border_style="bright_blue",
+        box=box.ROUNDED
+    )
+
+def build_big_timer(mins, secs):
+
+    timer = f"{mins:02}:{secs:02}"
+
+    txt = fig.renderText(timer)
+
+    return Panel(
+        Align.center(
+            f"[bold bright_cyan]{txt}[/]"
+        ),
+        border_style="cyan",
+        box=box.ROUNDED
+    )
+
+def build_progress(elapsed, total):
+
+    progress = Progress(
+
+        TextColumn("[bold cyan]Progress"),
+
+        BarColumn(bar_width=None),
+
+        TextColumn(
+            "[bold]{task.percentage:>3.0f}%"
+        ),
+
+        expand=True,
+
+    )
+
+    task = progress.add_task("", total=total)
+
+    progress.update(task, completed=elapsed)
+
+    return progress
+
+def build_layout(
+    mins,
+    secs,
+    elapsed,
+    total,
+    session,
+    total_sessions,
+    task_name,
+    phase,
+    visual_levels=0.0,
+    music="No Music",
+):
+
+    layout = Layout()
+
+    layout.split_column(
+
+        Layout(name="header", size=3),
+
+        Layout(name="body"),
+
+        Layout(name="footer", size=3),
+
+    )
+
+    layout["body"].split_column(
+
+        Layout(name="timer", size=11),
+
+        Layout(name="progress", size=4),
+
+        Layout(name="info", size=5),
+
+        Layout(name="visualizer"),
+
+    )
+
+    layout["header"].update(
+
+        build_header(
+
+            task_name,
+
+            music,
+
+            phase,
+
+        )
+
+    )
+
+    layout["timer"].update(
+
+        build_big_timer(
+
+            mins,
+
+            secs,
+
+        )
+
+    )
+
+    layout["progress"].update(
+
+        Panel(
+
+            build_progress(
+
+                elapsed,
+
+                total,
+
+            ),
+
+            title="[bold green]Progress[/]",
+
+            border_style="green",
+
+        )
+
+    )
+
+    info = Table.grid(expand=True)
+
+    info.add_column()
+
+    info.add_column()
+
+    info.add_row(
+
+        f"[bold]Session[/]\n{session}/{total_sessions}",
+
+        f"[bold]Mode[/]\n[cyan]{phase}[/]",
+
+    )
+
+    layout["info"].update(
+
+        Panel(
+
+            info,
+
+            border_style="yellow",
+
+        )
+
+    )
+    height = console.size.height - 18
+    layout["visualizer"].update(
+        Panel(
+            Align.center(
+                build_visualizer(
+                    visual_levels,
+                    height
+                ),
+                vertical="middle",
+            ),
+
+            border_style="magenta",
+
+            title="[bold]Audio Visualizer[/]",
+
+        )
+
+    )
+
+    layout["footer"].update(
+
+        build_footer()
+
+    )
+
+    return layout
+
 # ---------------------------------------------------------------------------
 # Loop utama satu fase (Focus / Break)
 # ---------------------------------------------------------------------------
 def run_phase(phase_label, minutes, task_name, session_num, total_sessions,
               audio_player, notifier, key_listener, show_audio):
     remaining = minutes * 60
+    last_tick = time.monotonic()
     paused = False
+    with Live(
 
-    while remaining >= 0:
-        key = key_listener.get_key()
-        if key == "q":
-            raise QuitPomodoro()
-        elif key == "s":
-            break
-        elif key == "p":
-            paused = not paused
-            if audio_player and show_audio:
-                audio_player.pause() if paused else audio_player.resume()
+        build_layout(
 
-        clear_screen()
-        elapsed = (minutes * 60) - remaining
-        mins, secs = divmod(remaining, 60)
-        layout = Table.grid(expand=True)
+            mins=minutes,
+            secs=0,
 
-        layout.add_row(
-            f"[bold red]🍅 {task_name}[/]"
-        )
+            elapsed=0,
 
-        layout.add_row("")
+            total=minutes * 60,
 
-        layout.add_row(
-            Align.center(
-                f"[bold bright_cyan]{mins:02}:{secs:02}[/]"
+            session=session_num,
+
+            total_sessions=total_sessions,
+
+            task_name=task_name,
+
+            phase=phase_label,
+
+            visual_levels=[0] * 32,
+
+        ),
+
+        refresh_per_second=30,
+
+        screen=True,
+
+    ) as live:
+        while remaining >= 0:
+            now = time.monotonic()
+            key = key_listener.get_key()
+            if key == "q":
+                raise QuitPomodoro()
+            elif key == "s":
+                break
+            elif key == "p":
+                paused = not paused
+                if audio_player and show_audio:
+                    audio_player.pause() if paused else audio_player.resume()
+
+            elapsed = (minutes * 60) - remaining
+            if not paused:
+
+                if now - last_tick >= 1:
+
+                    remaining -= 1
+
+                    last_tick = now
+
+            mins, secs = divmod(
+                max(remaining, 0),
+                60
             )
-        )
 
-        layout.add_row("")
+            elapsed = (minutes * 60) - remaining
+            
+            live.update(
 
-        layout.add_row(
-            progress_bar(
-                elapsed,
-                minutes * 60
-            )
-        )
+                build_layout(
 
-        layout.add_row("")
+                    mins=mins,
 
-        layout.add_row(
-            f"🎯 Session : [green]{session_num}/{total_sessions}[/]"
-        )
+                    secs=secs,
 
-        layout.add_row(
-            f"⚡ Phase : [yellow]{phase_label}[/]"
-        )
+                    elapsed=elapsed,
 
-        if paused:
-            layout.add_row(
-                "[bold red]⏸ PAUSED[/]"
-            )
+                    total=minutes * 60,
 
-        if show_audio:
+                    session=session_num,
 
-            layout.add_row("")
+                    total_sessions=total_sessions,
 
-            layout.add_row(
-                Align.center(
-                    render_visualizer(
-                        audio_player.get_level()
-                    )
+                    task_name=task_name,
+
+                    phase=phase_label,
+
+                    visual_levels=audio_player.get_levels(),
+
                 )
+
             )
 
-        layout.add_row("")
 
-        layout.add_row(
-            "[cyan]P[/] Pause    "
-            "[yellow]S[/] Skip    "
-            "[red]Q[/] Quit"
-        )
-
-        console.clear()
-
-        console.print(
-
-            Panel(
-                layout,
-                title="[bold green]Pomodoro[/]",
-                border_style="green",
-                padding=(1, 2),
-            )
-
-        )
-
-        if not paused:
-            time.sleep(1)
-            remaining -= 1
-        else:
-            time.sleep(0.1)
-
-import random
-
-_visual_cache = [1] * 24
+            
+            time.sleep(1 / 30)
 
 
-def render_visualizer(level):
 
-    global _visual_cache
+_history = [0.0] * 32
 
-    height = int(level * 49)
 
-    _visual_cache.pop(0)
+def build_visualizer(levels, height=16):
 
-    _visual_cache.append(
-        max(1, height + random.randint(-1, 1))
-    )
+    if levels is None:
+        levels = [0] * 32
 
-    blocks = "▁▂▃▄▅▆▇█"
+    rows = []
 
-    result = ""
+    for y in reversed(range(height)):
 
-    for h in _visual_cache:
+        line = Text()
 
-        h = max(1, min(8, h))
+        for value in levels:
 
-        color = (
-            "green"
-            if h < 4
-            else "yellow"
-            if h < 6
-            else "red"
-        )
+            filled = int(value * height)
 
-        result += f"[{color}]{blocks[h-1]}[/] "
+            if filled > y:
 
-    return result
+                ratio = y / height
+
+                if ratio < 0.35:
+                    style = "green"
+
+                elif ratio < 0.7:
+                    style = "yellow"
+
+                else:
+                    style = "red"
+
+                line.append("█ ", style=style)
+
+            else:
+
+                line.append("  ")
+
+        rows.append(line)
+
+    return Group(*rows)
 
 def progress_bar(current, total):
 
