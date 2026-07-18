@@ -176,6 +176,16 @@ class AudioVisualizerPlayer:
         self.ready = False
         self.error = None
         self.download_percent = 0
+        self.status = "Waiting..."
+
+        self.download_speed = ""
+        self.download_eta = ""
+        self.download_total = ""
+        self.download_current = ""
+
+        self.music_title = "No Music"
+        self.music_channel = ""
+        self.music_duration = ""
 
     def prepare(self) -> bool:
         """Unduh audio dari YouTube sebagai wav. Return True jika sukses."""
@@ -190,19 +200,32 @@ class AudioVisualizerPlayer:
             return False
 
         cache_file = self._cache_file()
-
+        self.status = "Checking cache..."
         if cache_file.exists():
+            with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+
+                info = ydl.extract_info(
+                    self.youtube_url,
+                    download=False
+                )
+
+                self.music_title = info.get(
+                    "title",
+                    "Cached Music"
+                )
+
+                self.music_channel = info.get(
+                    "uploader",
+                    ""
+                )
+
             self.filepath = str(cache_file)
             self.ready = True
+            self.status = "Using cached music"
             return True
 
-        if cache_file.exists():
-            console.print("[bold green]✓ Music ditemukan di cache[/]")
-            self.filepath = str(cache_file)
-            self.ready = True
-            return True
 
-        console.print("[bold yellow]↓ Downloading audio dari YouTube...[/]")
+        self.status = "Downloading..."
         
         self.tempdir = tempfile.mkdtemp(prefix="pomodoro_audio_")
 
@@ -225,9 +248,32 @@ class AudioVisualizerPlayer:
         }
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                self.status = "Downloading...."
+                info = ydl.extract_info(
+                    self.youtube_url,
+                    download=True
+                )
+
+                self.music_title = info.get(
+                    "title",
+                    "Unknown"
+                )
+
+                self.music_channel = info.get(
+                    "uploader",
+                    ""
+                )
+
+                duration = info.get("duration")
+
+                if duration:
+                    mins, secs = divmod(duration, 60)
+                    self.music_duration = f"{mins}:{secs:02}"
+
                 ydl.download([self.youtube_url])
         except Exception as e:
             self.error = f"Gagal mengunduh audio: {e}"
+            self.status = f"Gagal mengunduh audio: {e}";
             return False
 
         expected = os.path.join(self.tempdir, "track.wav")
@@ -242,7 +288,7 @@ class AudioVisualizerPlayer:
         if not os.path.exists(expected):
             self.error = "File audio hasil unduhan tidak ditemukan."
             return False
-        console.print("[bold green]✓ Audio berhasil disimpan ke cache[/]")
+        self.status = "Ready!"
 
         self.filepath = str(cache_file)
 
@@ -318,13 +364,7 @@ class AudioVisualizerPlayer:
                                     levels.append(0)
 
                             levels = np.array(levels)
-                            # 32 band
-                            # bands = np.array_split(fft, 32)
 
-                            # levels = np.array([
-                            #     band.mean() if len(band) else 0
-                            #     for band in bands
-                            # ])
                             edges = np.geomspace(
                                 1,
                                 len(fft),
@@ -371,14 +411,27 @@ class AudioVisualizerPlayer:
             self._level = 0.0
 
     def _progress_hook(self, d):
+
         if d["status"] == "downloading":
+
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
 
+            downloaded = d.get("downloaded_bytes", 0)
+
             if total:
-                downloaded = d.get("downloaded_bytes", 0)
+
                 self.download_percent = downloaded / total * 100
 
+            self.download_speed = d.get("_speed_str", "-")
+
+            self.download_eta = d.get("_eta_str", "-")
+
+            self.download_total = d.get("_total_bytes_str", "-")
+
+            self.download_current = d.get("_downloaded_bytes_str", "-")
+
         elif d["status"] == "finished":
+
             self.download_percent = 100
 
     def pause(self):
@@ -407,7 +460,6 @@ class AudioVisualizerPlayer:
         ).hexdigest()
 
         return CACHE_DIR / f"{name}.wav"
-
 
 
 def clear_screen():
@@ -514,6 +566,82 @@ def build_progress(elapsed, total):
     progress.update(task, completed=elapsed)
 
     return progress
+
+
+def build_download_layout(player):
+
+    progress = Progress(
+
+        TextColumn("[bold cyan]Downloading"),
+
+        BarColumn(bar_width=None),
+
+        TextColumn("[bold]{task.percentage:>3.0f}%"),
+
+        expand=True,
+
+    )
+
+    task = progress.add_task(
+        "",
+        total=100
+    )
+
+    progress.update(
+        task,
+        completed=player.download_percent
+    )
+
+    table = Table.grid(
+        padding=(0,2)
+    )
+
+    table.add_column()
+
+    table.add_column()
+
+    table.add_row(
+        "[cyan]Status",
+        player.status
+    )
+    table.add_row(
+        "[cyan]Speed",
+        player.download_speed
+    )
+
+    table.add_row(
+        "[green]Downloaded",
+        f"{player.download_current} / {player.download_total}"
+    )
+
+    table.add_row(
+        "[yellow]ETA",
+        player.download_eta
+    )
+
+    return Panel(
+
+        Group(
+
+            Align.center(
+                "[bold cyan]🎵 Preparing Music[/]"
+            ),
+
+            "",
+
+            progress,
+
+            "",
+
+            table,
+
+        ),
+
+        border_style="bright_blue",
+
+        title="[bold]Downloading Music[/]"
+
+    )
 
 def build_layout(
     mins,
@@ -678,6 +806,7 @@ def run_phase(phase_label, minutes, task_name, session_num, total_sessions,
             phase=phase_label,
 
             visual_levels=[0] * 32,
+            music=audio_player.music_title,
 
         ),
 
@@ -735,6 +864,8 @@ def run_phase(phase_label, minutes, task_name, session_num, total_sessions,
                     phase=phase_label,
 
                     visual_levels=audio_player.get_levels(),
+                    music=audio_player.music_title,
+
 
                 )
 
@@ -743,10 +874,6 @@ def run_phase(phase_label, minutes, task_name, session_num, total_sessions,
 
             
             time.sleep(1 / 30)
-
-
-
-_history = [0.0] * 32
 
 
 def build_visualizer(levels, height=16):
@@ -835,24 +962,47 @@ def main():
     show_audio = False
 
     if music_url:
-        ok = False
-        with console.status(
-            "[bold green]Preparing Music..."
-        ):
 
-            audio_player = AudioVisualizerPlayer(
-                music_url
-            )
+        audio_player = AudioVisualizerPlayer(
+            music_url
+        )
 
-            ok = audio_player.prepare()
-        if ok:
-            audio_player.play()
-            show_audio = True
-        else:
-            print(f"Audio tidak dapat diputar: {audio_player.error}")
-            print("Melanjutkan tanpa musik.\n")
-            audio_player = None
-            input()
+        thread = threading.Thread(
+            target=audio_player.prepare,
+            daemon=True
+        )
+
+        thread.start()
+        with Live(
+
+            build_download_layout(audio_player),
+
+            refresh_per_second=20,
+
+            screen=True,
+
+        ) as live:
+
+            while True:
+
+                live.update(
+                    build_download_layout(audio_player)
+                )
+
+                if not thread.is_alive():
+                    # render terakhir
+                    live.refresh()
+
+                    # kalau cache, tampilkan sebentar
+                    if audio_player.status == "Using cached music":
+                        time.sleep(0.8)
+
+                    break
+
+                time.sleep(0.05)
+        thread.join()
+        time.sleep(3)
+        audio_player.play()
 
     key_listener = KeyListener()
     key_listener.start()
