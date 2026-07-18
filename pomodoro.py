@@ -35,10 +35,12 @@ from rich.text import Text
 from rich.table import Table
 from rich.progress import Progress, BarColumn, TextColumn
 from rich.layout import Layout
-
+import hashlib
+from pathlib import Path
 import numpy as np
 
-
+CACHE_DIR = Path.home() / ".pomodoro" / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 console = Console()
 
 try:
@@ -162,6 +164,7 @@ class AudioVisualizerPlayer:
         self._thread = None
         self.ready = False
         self.error = None
+        self.download_percent = 0
 
     def prepare(self) -> bool:
         """Unduh audio dari YouTube sebagai wav. Return True jika sukses."""
@@ -175,11 +178,31 @@ class AudioVisualizerPlayer:
             self.error = "ffmpeg tidak ditemukan di PATH. Install ffmpeg terlebih dahulu."
             return False
 
+        cache_file = self._cache_file()
+
+        if cache_file.exists():
+            self.filepath = str(cache_file)
+            self.ready = True
+            return True
+
+        if cache_file.exists():
+            console.print("[bold green]✓ Music ditemukan di cache[/]")
+            self.filepath = str(cache_file)
+            self.ready = True
+            return True
+
+        console.print("[bold yellow]↓ Downloading audio dari YouTube...[/]")
+        
         self.tempdir = tempfile.mkdtemp(prefix="pomodoro_audio_")
-        out_template = os.path.join(self.tempdir, "track.%(ext)s")
+
+        out_template = os.path.join(
+            self.tempdir,
+            "track.%(ext)s"
+        )
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": out_template,
+            "progress_hooks": [self._progress_hook],
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "wav",
@@ -197,10 +220,18 @@ class AudioVisualizerPlayer:
             return False
 
         expected = os.path.join(self.tempdir, "track.wav")
+        cache_file = self._cache_file()
+
+        shutil.copy2(
+            expected,
+            cache_file
+        )
+
+        self.filepath = str(cache_file)
         if not os.path.exists(expected):
             self.error = "File audio hasil unduhan tidak ditemukan."
             return False
-
+        console.print("[bold green]✓ Audio berhasil disimpan ke cache[/]")
         self.filepath = expected
         self.ready = True
         return True
@@ -231,6 +262,17 @@ class AudioVisualizerPlayer:
         except Exception:
             self._level = 0.0
 
+    def _progress_hook(self, d):
+        if d["status"] == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+
+            if total:
+                downloaded = d.get("downloaded_bytes", 0)
+                self.download_percent = downloaded / total * 100
+
+        elif d["status"] == "finished":
+            self.download_percent = 100
+
     def pause(self):
         self._pause_event.set()
 
@@ -247,6 +289,14 @@ class AudioVisualizerPlayer:
     def get_level(self) -> float:
         return self._level
 
+    def _cache_file(self):
+
+        name = hashlib.md5(
+            self.youtube_url.encode("utf-8")
+        ).hexdigest()
+
+        return CACHE_DIR / f"{name}.wav"
+
 
 # ---------------------------------------------------------------------------
 # Helper tampilan
@@ -260,6 +310,16 @@ def render_bar(level: float, width: int = 30) -> str:
 def clear_screen():
     console.clear()
 
+def clear_cache():
+
+    if CACHE_DIR.exists():
+
+        shutil.rmtree(CACHE_DIR)
+
+    CACHE_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
 def prompt_int(label: str, default: int) -> int:
     raw = input(f"{label} [{default}]: ").strip()
@@ -381,7 +441,7 @@ def render_visualizer(level):
 
     global _visual_cache
 
-    height = int(level * 8)
+    height = int(level * 49)
 
     _visual_cache.pop(0)
 
@@ -515,6 +575,7 @@ def main():
             )
         )
         notifier.notify("Pomodoro Selesai", f"Semua sesi untuk '{task_name}' telah selesai!")
+        time.sleep(2)
 
     except QuitPomodoro:
         clear_screen()
