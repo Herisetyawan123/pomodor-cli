@@ -1,5 +1,6 @@
 # Pomodoro Timer Interaktif (CLI)
 
+![Preview](/images/preview.png)
 Pomodoro timer berbasis command line dengan countdown, pause/resume,
 musik latar dari YouTube (audio only) lengkap dengan visualizer level
 suara, dan notifikasi native macOS saat sesi selesai.
